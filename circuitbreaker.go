@@ -2,6 +2,7 @@ package circuitbreaker
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -35,6 +36,7 @@ type zeroToleranceConfig struct {
 	windowSize     int64
 	maximumProbes  int64
 	clock          Clock
+	httpErrors     func(int) bool
 }
 
 func defaultZeroToleranceConfig() zeroToleranceConfig {
@@ -45,6 +47,7 @@ func defaultZeroToleranceConfig() zeroToleranceConfig {
 		windowSize:     int64(240 * time.Second),
 		maximumProbes:  1,
 		clock:          realClock{},
+		httpErrors:     func(sc int) bool { return (sc >= 400 && sc <= 599) },
 	}
 }
 
@@ -53,6 +56,7 @@ type CircuitBreaker interface {
 	Request() (bool, time.Duration)
 	ReportSuccess()
 	ReportFailure()
+	HTTPRequest(*http.Request) (*http.Response, error)
 }
 
 // ZeroToleranceOption configures a zero tolerance circuit breaker.
@@ -62,6 +66,14 @@ type ZeroToleranceOption func(*zeroToleranceConfig) error
 func WithClock(clock Clock) ZeroToleranceOption {
 	return func(c *zeroToleranceConfig) error {
 		c.clock = clock
+		return nil
+	}
+}
+
+// WithCustomHTTPErrors sets a custom function to determine which HTTP status codes are errors.
+func WithCustomHTTPErrors(httpErrors func(int) bool) ZeroToleranceOption {
+	return func(c *zeroToleranceConfig) error {
+		c.httpErrors = httpErrors
 		return nil
 	}
 }
