@@ -1,10 +1,15 @@
 package circuitbreaker
 
 import (
+	"errors"
 	"math/rand"
+	"net/http"
 	"sync/atomic"
 	"time"
 )
+
+// ErrCircuitOpen is returned when a request is rejected because the circuit breaker is open.
+var ErrCircuitOpen = errors.New("circuit breaker is open")
 
 type zeroToleranceCircuitBreaker struct {
 	config zeroToleranceConfig
@@ -19,10 +24,14 @@ type zeroToleranceCircuitBreaker struct {
 	openedAt     atomic.Int64
 	probes       atomic.Int64
 	clock        Clock
+	client       *http.Client
 }
 
 func newZeroToleranceCircuitBreaker(c zeroToleranceConfig) *zeroToleranceCircuitBreaker {
-	r := &zeroToleranceCircuitBreaker{config: c, clock: c.clock}
+	r := &zeroToleranceCircuitBreaker{config: c,
+		clock:  c.clock,
+		client: &http.Client{Timeout: 10 * time.Second},
+	}
 	r.state.Store(int64(Closed))
 	r.probes.Store(c.maximumProbes)
 	r.windowStart.Store(c.clock.Now().UnixNano())
@@ -136,4 +145,25 @@ func (cb *zeroToleranceCircuitBreaker) ReportSuccess() {
 	if cb.shouldClose() {
 		cb.toState(Closed)
 	}
+}
+
+func (cb *zeroToleranceCircuitBreaker) HTTPRequest(r *http.Request) (*http.Response, error) {
+	allowed, _ := cb.Request()
+	if !allowed {
+		return nil, ErrCircuitOpen
+	}
+
+	resp, err := cb.client.Do(r)
+	if err != nil {
+		cb.ReportFailure()
+		return resp, err
+	}
+
+	if cb.config.httpErrors(resp.StatusCode) {
+		cb.ReportFailure()
+	} else {
+		cb.ReportSuccess()
+	}
+
+	return resp, nil
 }
