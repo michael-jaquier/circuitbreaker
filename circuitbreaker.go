@@ -21,6 +21,7 @@ const (
 // CircuitBreaker manages request flow and failure handling.
 type CircuitBreaker interface {
 	Execute(context.Context, func(context.Context) error) (*time.Timer, error)
+	ExecuteBlocking(context.Context, func(context.Context) error) error
 	Close()
 }
 
@@ -128,6 +129,27 @@ func (cb *circuitBreaker) allow() allowResult {
 		return allowResult{allowed: false, timer: time.NewTimer(waitDuration)}
 	default:
 		return allowResult{allowed: true}
+	}
+}
+
+func (cb *circuitBreaker) ExecuteBlocking(
+	ctx context.Context, fn func(context.Context) error) error {
+	for {
+		timer, err := cb.Execute(ctx, fn)
+
+		// Handle success/error immediately
+		if timer == nil {
+			return err
+		}
+
+		// Wait for circuit to potentially allow retry
+		select {
+		case <-timer.C:
+			continue
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
 	}
 }
 

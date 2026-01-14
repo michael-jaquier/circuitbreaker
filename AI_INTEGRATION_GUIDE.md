@@ -294,12 +294,9 @@ timer, err := breaker.Execute(ctx, func(ctx context.Context) error {
 
 **2. Timer Return Pattern**
 
-The circuit breaker returns `(*time.Timer, error)` with specific semantics:
+The circuit breaker provides two execution methods:
 
-- `(timer, nil)` - Circuit is OPEN, function was NOT executed
-- `(nil, error)` - Circuit is CLOSED/HALF-OPEN, function WAS executed and returned error
-- `(nil, nil)` - Circuit is CLOSED/HALF-OPEN, function WAS executed successfully
-
+**Execute()** - Manual timer handling:
 ```go
 timer, err := breaker.Execute(ctx, func(ctx context.Context) error {
     // Make HTTP request
@@ -321,6 +318,33 @@ if err != nil {
 
 // Success! Function executed and succeeded
 ```
+
+**ExecuteBlocking()** - Automatic retry on circuit open (simplified):
+```go
+err := breaker.ExecuteBlocking(ctx, func(ctx context.Context) error {
+    // Make HTTP request
+    return httpErr
+})
+
+// Automatically waits when circuit is open
+// Returns immediately on success or function error
+if err != nil {
+    // Either function error or context cancelled
+    return fmt.Errorf("request failed: %w", err)
+}
+
+// Success!
+```
+
+Use `ExecuteBlocking()` when:
+- You want automatic waiting when circuit is open
+- The calling code can tolerate latency from waiting
+- You don't need custom fallback logic when circuit opens
+
+Use `Execute()` when:
+- You need immediate feedback that circuit is open
+- You have fallback strategies (cache, default values)
+- You want to avoid blocking the caller
 
 **3. Timeout Configuration**
 
@@ -1198,7 +1222,7 @@ func ExampleMiddlewareUsage() {
 
 Use these templates with placeholder substitution for AI code generation.
 
-### Template 1: Basic HTTP Client Template
+### Template 1: Basic HTTP Client Template (with Execute)
 
 ```go
 type {{ServiceName}}Client struct {
@@ -1248,6 +1272,46 @@ func (c *{{ServiceName}}Client) {{MethodName}}(ctx context.Context{{PARAMS}}) ({
     if timer != nil {
         return {{ZERO_VALUE}}, fmt.Errorf("{{SERVICE_NAME}} unavailable: %w", errors.New("circuit breaker is open"))
     }
+    if err != nil {
+        return {{ZERO_VALUE}}, fmt.Errorf("request failed: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return {{ZERO_VALUE}}, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+    }
+
+    {{DECODE_LOGIC}}
+    return {{RESULT}}, nil
+}
+```
+
+### Template 1B: Basic HTTP Client Template (with ExecuteBlocking)
+
+Use this when you want automatic retry on circuit open:
+
+```go
+func (c *{{ServiceName}}Client) {{MethodName}}Blocking(ctx context.Context{{PARAMS}}) ({{RETURN_TYPE}}, error) {
+    req, err := http.NewRequestWithContext(ctx, "{{HTTP_METHOD}}", c.baseURL+"{{PATH}}", {{BODY}})
+    if err != nil {
+        return {{ZERO_VALUE}}, fmt.Errorf("failed to create request: %w", err)
+    }
+
+    var resp *http.Response
+    var httpErr error
+
+    err = c.breaker.ExecuteBlocking(ctx, func(ctx context.Context) error {
+        resp, httpErr = c.client.Do(req)
+        if httpErr != nil {
+            return httpErr
+        }
+
+        if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+            return fmt.Errorf("server error: %d", resp.StatusCode)
+        }
+        return nil
+    })
+
     if err != nil {
         return {{ZERO_VALUE}}, fmt.Errorf("request failed: %w", err)
     }
