@@ -144,6 +144,48 @@ func (a *APIClient) Post(ctx context.Context, path string, payload interface{}) 
 	return body, nil
 }
 
+// GetBlocking performs a GET request with automatic retry on circuit open
+// This method blocks until success or context cancellation
+func (a *APIClient) GetBlocking(ctx context.Context, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", a.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	var resp *http.Response
+	var httpErr error
+
+	execErr := a.breaker.ExecuteBlocking(ctx, func(ctx context.Context) error {
+		resp, httpErr = a.client.Do(req)
+		if httpErr != nil {
+			return httpErr
+		}
+
+		// Check for 5xx errors (based on config)
+		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+			return fmt.Errorf("server error: %d", resp.StatusCode)
+		}
+		return nil
+	})
+
+	if execErr != nil {
+		return nil, fmt.Errorf("request failed: %w", execErr)
+	}
+
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	return body, nil
+}
+
 func main() {
 	// Example 1: Basic usage with real API
 	client, err := NewAPIClient(APIClientConfig{
@@ -218,10 +260,124 @@ func main() {
 		}
 	}
 
+	// Example with ExecuteBlocking (automatic retry on circuit open)
+	fmt.Println("=== Example 5: ExecuteBlocking (automatic retry) ===")
+	blockingClient, _ := NewAPIClient(APIClientConfig{
+		BaseURL:        "https://jsonplaceholder.typicode.com",
+		Timeout:        10 * time.Second,
+		CooldownTimer:  3 * time.Second,
+		SuccessToClose: 1,
+	})
+
+	// First request succeeds
+	data, err = blockingClient.GetBlocking(ctx, "/posts/1")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		fmt.Printf("Success! Received %d bytes\n", len(data))
+	}
+
+	// Simulate circuit opening with bad request
+	badBlockingClient, _ := NewAPIClient(APIClientConfig{
+		BaseURL:        "http://localhost:99999",
+		Timeout:        1 * time.Second,
+		CooldownTimer:  2 * time.Second,
+		SuccessToClose: 1,
+	})
+
+	// Open the circuit
+	_, _ = badBlockingClient.Get(ctx, "/test")
+
+	// ExecuteBlocking will wait for circuit to become half-open
+	fmt.Println("Calling GetBlocking (will wait for circuit to open)...")
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	_, err = badBlockingClient.GetBlocking(ctxWithTimeout, "/test")
+	if err != nil {
+		if strings.Contains(err.Error(), "context deadline") {
+			fmt.Println("Request cancelled after timeout (circuit was waiting)")
+		} else {
+			fmt.Printf("Request failed: %v\n", err)
+		}
+	}
+	fmt.Println()
+
+	// Example with ExecuteHTTPBlocking (simplified API with automatic retry)
+	fmt.Println("=== Example 6: ExecuteHTTPBlocking (Simplified API) ===")
+	simpleClient, _ := NewAPIClient(APIClientConfig{
+		BaseURL:        "https://jsonplaceholder.typicode.com",
+		Timeout:        10 * time.Second,
+		CooldownTimer:  3 * time.Second,
+		SuccessToClose: 1,
+	})
+
+	// Request factory for GET
+	getRequestFactory := func() (*http.Request, error) {
+		return http.NewRequest("GET", simpleClient.baseURL+"/posts/1", nil)
+	}
+
+	resp, err := simpleClient.breaker.ExecuteHTTPBlocking(
+		context.Background(),
+		simpleClient.client,
+		getRequestFactory,
+	)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("Success! Received %d bytes\n", len(body))
+		fmt.Println("ExecuteHTTPBlocking automatically handles:")
+		fmt.Println("- Request body replay for POST/PUT/PATCH")
+		fmt.Println("- Retryable vs non-retryable error classification")
+		fmt.Println("- Circuit breaker integration with automatic waiting")
+	}
+	fmt.Println()
+
+	// Example with POST using ExecuteHTTPBlocking
+	fmt.Println("=== Example 7: POST with ExecuteHTTPBlocking ===")
+	payload2 := map[string]interface{}{
+		"title":  "Circuit Breaker Test",
+		"body":   "Testing ExecuteHTTPBlocking with POST",
+		"userId": 1,
+	}
+	jsonData2, _ := json.Marshal(payload2)
+
+	// Request factory for POST - creates fresh request each retry
+	postRequestFactory := func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", simpleClient.baseURL+"/posts", bytes.NewBuffer(jsonData2))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}
+
+	resp, err = simpleClient.breaker.ExecuteHTTPBlocking(
+		context.Background(),
+		simpleClient.client,
+		postRequestFactory,
+	)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("Success! Received %d bytes\n", len(body))
+		fmt.Println("Request factory pattern enables body replay on retry")
+	}
+	fmt.Println()
+
 	fmt.Println("=== Circuit Breaker Integration Complete ===")
 	fmt.Println("Key takeaways:")
 	fmt.Println("1. Circuit opens on network errors and 5xx server errors")
 	fmt.Println("2. 4xx client errors don't open the circuit")
-	fmt.Println("3. Blocked requests fail fast with ErrCircuitOpen")
-	fmt.Println("4. Circuit recovers after cooldown period with successful probes")
+	fmt.Println("3. Execute() fails fast with timer when circuit is open")
+	fmt.Println("4. ExecuteBlocking() automatically waits when circuit is open")
+	fmt.Println("5. Circuit recovers after cooldown period with successful probes")
+	fmt.Println("6. ExecuteHTTPBlocking provides simplified API with automatic:")
+	fmt.Println("   - HTTP error classification (408, 429, 5xx retryable)")
+	fmt.Println("   - Request body replay via factory pattern")
+	fmt.Println("   - Response body management")
 }
