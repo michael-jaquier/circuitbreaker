@@ -37,7 +37,7 @@ golint: bin/golint
 	@$(GOBIN)/golint -set_exit_status ./...
 
 .PHONY: lint
-lint: gofmt golint staticcheck
+lint: gofmt golint staticcheck check-examples
 
 .PHONY: staticcheck
 staticcheck: bin/staticcheck
@@ -46,6 +46,34 @@ staticcheck: bin/staticcheck
 .PHONY: vet
 vet:
 	go vet ./...
+
+.PHONY: vet-examples
+vet-examples:
+	@echo "Vetting examples..."
+	@cd examples/http_client && go vet .
+	@cd examples/repository_pattern && go vet .
+	@cd examples/grpc_service && go vet .
+	@echo "Examples vet passed"
+
+.PHONY: lint-examples
+lint-examples:
+	@echo "Linting examples..."
+	@cd examples/http_client && go fmt . && golint .
+	@cd examples/repository_pattern && go fmt . && golint .
+	@cd examples/grpc_service && go fmt . && golint .
+	@echo "Examples lint passed"
+
+.PHONY: build-examples
+build-examples:
+	@echo "Building examples..."
+	@cd examples/http_client && go build -o /dev/null .
+	@cd examples/repository_pattern && go build -o /dev/null .
+	@cd examples/grpc_service && go build -o /dev/null .
+	@echo "Examples build passed"
+
+.PHONY: check-examples
+check-examples: vet-examples build-examples
+	@echo "All example checks passed"
 
 .PHONY: gosec
 gosec: bin/gosec
