@@ -56,24 +56,44 @@ Q: How should errors be classified (HTTP only)?
 ├─ Only 5xx errors → Check status code >= 500 in Execute callback
 ├─ Both 4xx and 5xx → Check status code >= 400 in Execute callback
 └─ Custom logic → Implement custom status code check in Execute callback
+
+Q: Should you use blocking or non-blocking execution?
+│
+├─ User-facing requests (APIs, web handlers)
+│  └─ Use Execute() - fail fast, return errors immediately
+│
+├─ Background workers, batch jobs
+│  └─ Use ExecuteBlocking() or specific blocking methods
+│
+├─ HTTP Client implementation
+│  ├─ Need automatic retry and intelligent status classification
+│  │  └─ Use ExecuteHTTPBlocking()
+│  └─ Need custom fallback logic or immediate circuit open feedback
+│     └─ Use Execute()
+│
+└─ gRPC Client implementation
+   ├─ Need automatic retry and clean interface
+   │  └─ Use ExecuteGRPCBlocking()
+   └─ Need custom fallback or immediate circuit open feedback
+      └─ Use Execute()
 ```
 
 ## Configuration Decision Matrix
 
-| Scenario | WindowSize | CooldownTimer | SuccessToClose | MaxProbes | Status Code Check |
-|----------|------------|---------------|----------------|-----------|------------------|
-| Critical Payment Service | 60s | 30s | 3 | 1 | 5xx only |
-| User Profile API | 240s (default) | 120s (default) | 5 (default) | 1 | default (4xx, 5xx) |
-| Analytics Service | 300s | 180s | 10 | 3 | 5xx only |
-| Internal Admin API | 120s | 60s | 5 | 2 | default |
-| Background Data Sync | 600s | 300s | 5 | 1 | 5xx only |
-| Health Check Endpoint | 60s | 30s | 3 | 1 | default |
+| Scenario | WindowSize | CooldownTimer | SuccessToClose | MaxProbes | Status Code Check | Execution Method |
+|----------|------------|---------------|----------------|-----------|------------------|------------------|
+| Critical Payment Service | 60s | 30s | 3 | 1 | 5xx only | Execute() |
+| User Profile API | 240s (default) | 120s (default) | 5 (default) | 1 | default (4xx, 5xx) | Execute() |
+| Analytics Service | 300s | 180s | 10 | 3 | 5xx only | ExecuteHTTPBlocking() |
+| Internal Admin API | 120s | 60s | 5 | 2 | default | Execute() |
+| Background Data Sync | 600s | 300s | 5 | 1 | 5xx only | ExecuteHTTPBlocking() |
+| Health Check Endpoint | 60s | 30s | 3 | 1 | default | Execute() |
 
 ## Complete Working Examples
 
-### Example 1: HTTP API Client Wrapper
+### Example 1A: HTTP API Client with Execute (Manual Timer Handling)
 
-Complete, production-ready HTTP client with circuit breaker protection.
+Complete, production-ready HTTP client with circuit breaker protection using Execute() for manual control.
 
 ```go
 package httpclient
@@ -240,6 +260,155 @@ func ExampleUsage() {
     fmt.Printf("Response: %s\n", data)
 }
 ```
+
+### Example 1B: HTTP API Client with ExecuteHTTPBlocking (Automatic Retry)
+
+Simplified HTTP client using ExecuteHTTPBlocking for automatic retry and intelligent status code classification. Best for background workers and batch jobs.
+
+```go
+package httpclient
+
+import (
+    "bytes"
+    "context"
+    "fmt"
+    "io"
+    "net/http"
+    "time"
+
+    "github.com/michael-jaquier/circuitbreaker"
+)
+
+// BlockingAPIClient wraps an HTTP client with ExecuteHTTPBlocking
+type BlockingAPIClient struct {
+    baseURL string
+    breaker circuitbreaker.CircuitBreaker
+    client  *http.Client
+}
+
+// NewBlockingAPIClient creates a new HTTP client with ExecuteHTTPBlocking
+func NewBlockingAPIClient(baseURL string, timeout, cooldown time.Duration) (*BlockingAPIClient, error) {
+    cb, err := circuitbreaker.NewZeroTolerance(
+        circuitbreaker.WithCooldownTimer(cooldown),
+        circuitbreaker.WithSuccessToClose(3),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to create circuit breaker: %w", err)
+    }
+
+    return &BlockingAPIClient{
+        baseURL: baseURL,
+        breaker: cb,
+        client:  &http.Client{Timeout: timeout},
+    }, nil
+}
+
+// Get performs a GET request with automatic retry
+func (c *BlockingAPIClient) Get(ctx context.Context, path string) ([]byte, error) {
+    // Request factory creates fresh request for each retry
+    requestFactory := func() (*http.Request, error) {
+        return http.NewRequest("GET", c.baseURL+path, nil)
+    }
+
+    // ExecuteHTTPBlocking handles:
+    // - Automatic retry when circuit is open
+    // - Status code classification (408, 429, 5xx retryable)
+    // - Request recreation for each retry
+    resp, err := c.breaker.ExecuteHTTPBlocking(ctx, c.client, requestFactory)
+    if err != nil {
+        return nil, fmt.Errorf("request failed: %w", err)
+    }
+    defer resp.Body.Close()
+
+    // Read response body
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read response: %w", err)
+    }
+
+    // Check for non-retryable client errors (4xx except 408, 429)
+    if resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+        resp.StatusCode != 408 && resp.StatusCode != 429 {
+        return nil, fmt.Errorf("client error: %d, body: %s", resp.StatusCode, string(body))
+    }
+
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        return nil, fmt.Errorf("unexpected status: %d, body: %s", resp.StatusCode, string(body))
+    }
+
+    return body, nil
+}
+
+// Post performs a POST request with automatic retry and body replay
+func (c *BlockingAPIClient) Post(ctx context.Context, path string, jsonBody []byte) ([]byte, error) {
+    // Request factory creates fresh request with fresh body for each retry
+    requestFactory := func() (*http.Request, error) {
+        req, err := http.NewRequest("POST", c.baseURL+path, bytes.NewBuffer(jsonBody))
+        if err != nil {
+            return nil, err
+        }
+        req.Header.Set("Content-Type", "application/json")
+        return req, nil
+    }
+
+    resp, err := c.breaker.ExecuteHTTPBlocking(ctx, c.client, requestFactory)
+    if err != nil {
+        return nil, fmt.Errorf("request failed: %w", err)
+    }
+    defer resp.Body.Close()
+
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read response: %w", err)
+    }
+
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        return nil, fmt.Errorf("unexpected status: %d, body: %s", resp.StatusCode, string(body))
+    }
+
+    return body, nil
+}
+
+// Example usage
+func ExampleBlockingUsage() {
+    client, err := NewBlockingAPIClient(
+        "https://api.example.com",
+        10*time.Second,  // HTTP timeout
+        60*time.Second,  // Circuit breaker cooldown
+    )
+    if err != nil {
+        panic(err)
+    }
+
+    // Context with timeout provides natural retry boundary
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+    defer cancel()
+
+    // Automatically retries when circuit is open
+    // No need to check for timer or handle circuit open state
+    data, err := client.Get(ctx, "/users/123")
+    if err != nil {
+        // Either request failed or context timeout exceeded
+        fmt.Printf("Error: %v\n", err)
+        return
+    }
+
+    fmt.Printf("Response: %s\n", data)
+}
+```
+
+**Key advantages of ExecuteHTTPBlocking:**
+
+1. **Reduced boilerplate**: 3 lines vs 15+ lines with Execute()
+2. **Request factory pattern**: Fresh request for each retry enables body replay
+3. **Built-in classification**: 408, 429, 5xx automatically retried; other 4xx fail fast
+4. **Automatic waiting**: No manual timer handling needed
+5. **Context-aware**: Respects context timeout as retry boundary
+
+**When NOT to use:**
+- User-facing request handlers (use Execute() for immediate response)
+- Need custom fallback logic when circuit opens
+- Want fine-grained control over retry behavior
 
 #### HTTP Client Best Practices
 
@@ -408,6 +577,177 @@ if err != nil {
 // The circuit breaker records the result before we read the body
 defer resp.Body.Close()
 body, err := io.ReadAll(resp.Body)
+```
+
+## Blocking vs Non-Blocking Execution Methods
+
+The circuit breaker provides four execution methods, each suited for different scenarios:
+
+### Method Comparison
+
+| Method | Returns on Circuit Open | Response Type | Code Complexity | Best Use Case |
+|--------|------------------------|---------------|-----------------|---------------|
+| **Execute()** | Timer object (non-blocking) | (timer, error) | 10-15 lines per call | User-facing APIs, custom fallback logic |
+| **ExecuteBlocking()** | Blocks and waits | error | 3-5 lines per call | Background jobs, generic operations |
+| **ExecuteHTTPBlocking()** | Blocks and waits | (*http.Response, error) | 3-5 lines per call | HTTP clients in background/batch contexts |
+| **ExecuteGRPCBlocking()** | Blocks and waits | (interface{}, error) | 3 lines per call | gRPC clients in background/batch contexts |
+
+### Execute() - Non-Blocking with Manual Timer Handling
+
+**Signature:**
+```go
+Execute(ctx context.Context, fn func(context.Context) error) (<-chan time.Time, error)
+```
+
+**Use when:**
+- Handling user-facing requests that need immediate responses
+- Implementing custom fallback logic when circuit is open
+- Need fine-grained control over retry behavior
+- Want to avoid blocking the caller
+
+**Pattern:**
+```go
+timer, err := breaker.Execute(ctx, func(ctx context.Context) error {
+    return someOperation(ctx)
+})
+
+if timer != nil {
+    // Circuit is OPEN - function was NOT executed
+    // Return cached data, default value, or error immediately
+    return cachedData, nil
+}
+
+if err != nil {
+    // Function executed but returned error
+    return nil, err
+}
+
+// Success!
+return result, nil
+```
+
+### ExecuteBlocking() - Generic Blocking with Automatic Retry
+
+**Signature:**
+```go
+ExecuteBlocking(ctx context.Context, fn func(context.Context) error) error
+```
+
+**Use when:**
+- Background workers or batch jobs where latency is acceptable
+- No need for protocol-specific features (HTTP/gRPC)
+- Want automatic retry without manual timer handling
+- Database calls, message queue operations, generic external services
+
+**Pattern:**
+```go
+err := breaker.ExecuteBlocking(ctx, func(ctx context.Context) error {
+    return someOperation(ctx)
+})
+
+// Automatically waits when circuit is open
+// Returns immediately on success or function error
+if err != nil {
+    return fmt.Errorf("operation failed: %w", err)
+}
+
+// Success!
+return nil
+```
+
+**Key differences from Execute():**
+- No timer returned - blocks automatically when circuit is open
+- Continues retrying until context timeout or success
+- Reduces boilerplate from 15+ lines to 3-5 lines
+
+### ExecuteHTTPBlocking() - HTTP-Specific Blocking with Intelligent Classification
+
+**Signature:**
+```go
+ExecuteHTTPBlocking(ctx context.Context, client *http.Client,
+    requestFactory func() (*http.Request, error)) (*http.Response, error)
+```
+
+**Use when:**
+- HTTP client in background workers or batch jobs
+- Want automatic retry with built-in HTTP status code classification
+- Need request body replay for POST/PUT/PATCH
+- Don't need custom fallback logic
+
+**Pattern:**
+```go
+// Request factory creates fresh request for each retry
+requestFactory := func() (*http.Request, error) {
+    return http.NewRequest("GET", "https://api.example.com/data", nil)
+}
+
+resp, err := breaker.ExecuteHTTPBlocking(ctx, client, requestFactory)
+if err != nil {
+    return nil, fmt.Errorf("HTTP request failed: %w", err)
+}
+defer resp.Body.Close()
+
+body, _ := io.ReadAll(resp.Body)
+return body, nil
+```
+
+**Built-in features:**
+- **Status code classification**: 408, 429, 5xx treated as retryable; other 4xx non-retryable
+- **Request factory pattern**: Creates fresh request for each retry (enables body replay)
+- **Response management**: Returns full http.Response with body intact
+- **Automatic retry**: Blocks and waits when circuit is open
+
+### ExecuteGRPCBlocking() - gRPC-Specific Blocking with Clean Interface
+
+**Signature:**
+```go
+ExecuteGRPCBlocking(ctx context.Context,
+    fn func(context.Context) (interface{}, error)) (interface{}, error)
+```
+
+**Use when:**
+- gRPC client in background workers or batch jobs
+- Want to eliminate 30+ lines of retry boilerplate
+- Context timeout provides natural retry boundary
+- Don't need custom fallback logic
+
+**Pattern:**
+```go
+resp, err := breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+    return grpcClient.SomeMethod(ctx, req)
+})
+if err != nil {
+    return nil, fmt.Errorf("gRPC call failed: %w", err)
+}
+
+// Type assert the response
+typedResp := resp.(*pb.SomeMethodResponse)
+return typedResp, nil
+```
+
+**Key differences from HTTP:**
+- Returns `interface{}` requiring type assertion (vs concrete `*http.Response`)
+- Retries on any error (vs selective HTTP status codes)
+- No response body management needed
+
+### Decision Framework
+
+```
+START
+  │
+  ├─ Is this a user-facing request? (API handler, web endpoint)
+  │  └─ YES → Use Execute() with immediate fallback
+  │
+  ├─ Is this HTTP?
+  │  ├─ YES → Use ExecuteHTTPBlocking()
+  │  │        Benefits: Request factory, status code classification
+  │  │
+  │  └─ NO → Is this gRPC?
+  │           ├─ YES → Use ExecuteGRPCBlocking()
+  │           │        Benefits: Clean interface, automatic retry
+  │           │
+  │           └─ NO → Use ExecuteBlocking()
+  │                    Benefits: Generic, works with any operation
 ```
 
 ### Example 2: Database Connection Wrapper
@@ -1218,6 +1558,225 @@ func ExampleMiddlewareUsage() {
 }
 ```
 
+### Example 8: gRPC Client with ExecuteGRPCBlocking
+
+Complete gRPC client using ExecuteGRPCBlocking for clean, boilerplate-free implementation. Best for background workers and service-to-service calls.
+
+```go
+package grpcclient
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/michael-jaquier/circuitbreaker"
+    "google.golang.org/grpc"
+    pb "your/proto/package"  // Replace with your protobuf package
+)
+
+// UserServiceClient wraps a gRPC client with circuit breaker protection
+type UserServiceClient struct {
+    client  pb.UserServiceClient
+    breaker circuitbreaker.CircuitBreaker
+}
+
+// NewUserServiceClient creates a new gRPC client with circuit breaker
+func NewUserServiceClient(conn *grpc.ClientConn) (*UserServiceClient, error) {
+    cb, err := circuitbreaker.NewZeroTolerance(
+        circuitbreaker.WithCooldownTimer(30 * time.Second),
+        circuitbreaker.WithSuccessToClose(3),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to create circuit breaker: %w", err)
+    }
+
+    return &UserServiceClient{
+        client:  pb.NewUserServiceClient(conn),
+        breaker: cb,
+    }, nil
+}
+
+// GetUser retrieves a user by ID with automatic retry
+func (c *UserServiceClient) GetUser(ctx context.Context, userID string) (*pb.User, error) {
+    // ExecuteGRPCBlocking eliminates 30+ lines of boilerplate
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.GetUser(ctx, &pb.GetUserRequest{UserId: userID})
+    })
+    if err != nil {
+        return nil, fmt.Errorf("GetUser failed: %w", err)
+    }
+
+    // Type assert the response
+    user := resp.(*pb.User)
+    return user, nil
+}
+
+// ListUsers retrieves all users with pagination
+func (c *UserServiceClient) ListUsers(ctx context.Context, pageSize int32) ([]*pb.User, error) {
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.ListUsers(ctx, &pb.ListUsersRequest{
+            PageSize: pageSize,
+        })
+    })
+    if err != nil {
+        return nil, fmt.Errorf("ListUsers failed: %w", err)
+    }
+
+    listResp := resp.(*pb.ListUsersResponse)
+    return listResp.Users, nil
+}
+
+// CreateUser creates a new user
+func (c *UserServiceClient) CreateUser(ctx context.Context, user *pb.User) (*pb.User, error) {
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.CreateUser(ctx, &pb.CreateUserRequest{User: user})
+    })
+    if err != nil {
+        return nil, fmt.Errorf("CreateUser failed: %w", err)
+    }
+
+    created := resp.(*pb.User)
+    return created, nil
+}
+
+// UpdateUser updates an existing user
+func (c *UserServiceClient) UpdateUser(ctx context.Context, user *pb.User) (*pb.User, error) {
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.UpdateUser(ctx, &pb.UpdateUserRequest{User: user})
+    })
+    if err != nil {
+        return nil, fmt.Errorf("UpdateUser failed: %w", err)
+    }
+
+    updated := resp.(*pb.User)
+    return updated, nil
+}
+
+// Example usage
+func ExampleGRPCUsage() {
+    // Create gRPC connection
+    conn, err := grpc.Dial(
+        "localhost:50051",
+        grpc.WithInsecure(), // Use WithTransportCredentials in production
+    )
+    if err != nil {
+        panic(fmt.Sprintf("Failed to connect: %v", err))
+    }
+    defer conn.Close()
+
+    // Create client with circuit breaker
+    client, err := NewUserServiceClient(conn)
+    if err != nil {
+        panic(err)
+    }
+
+    // Context with timeout provides natural retry boundary
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+    defer cancel()
+
+    // Get user - automatically retries when circuit is open
+    user, err := client.GetUser(ctx, "user-123")
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+        return
+    }
+    fmt.Printf("User: %+v\n", user)
+
+    // List users
+    users, err := client.ListUsers(ctx, 100)
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+        return
+    }
+    fmt.Printf("Found %d users\n", len(users))
+
+    // Create user
+    newUser := &pb.User{
+        Id:    "user-456",
+        Name:  "John Doe",
+        Email: "john@example.com",
+    }
+    created, err := client.CreateUser(ctx, newUser)
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+        return
+    }
+    fmt.Printf("Created user: %+v\n", created)
+}
+```
+
+#### Comparison: Old vs New Pattern
+
+**OLD PATTERN (30+ lines per method with Execute()):**
+```go
+func (c *UserServiceClient) GetUser(ctx context.Context, userID string) (*pb.User, error) {
+    var resp *pb.User
+    var grpcErr error
+
+    // Retry loop with manual timer handling
+    retryCtx, retryCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+    defer retryCancel()
+
+    for {
+        timer, err := c.breaker.Execute(ctx, func(ctx context.Context) error {
+            resp, grpcErr = c.client.GetUser(ctx, &pb.GetUserRequest{UserId: userID})
+            return grpcErr
+        })
+
+        if timer != nil {
+            // Circuit is open, wait for timer
+            slog.Warn("circuit breaker open - waiting for retry")
+            select {
+            case <-timer.C:
+                continue  // Retry
+            case <-retryCtx.Done():
+                return nil, fmt.Errorf("retry timeout exceeded")
+            }
+        }
+
+        if err != nil {
+            slog.Error("request failed", "error", err)
+            return nil, err
+        }
+
+        // Success
+        return resp, nil
+    }
+}
+```
+
+**NEW PATTERN (3 lines with ExecuteGRPCBlocking):**
+```go
+func (c *UserServiceClient) GetUser(ctx context.Context, userID string) (*pb.User, error) {
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.GetUser(ctx, &pb.GetUserRequest{UserId: userID})
+    })
+    if err != nil {
+        return nil, err
+    }
+    return resp.(*pb.User), nil
+}
+```
+
+**Benefits:**
+- **90% less code**: 3 lines vs 30+ lines
+- **No manual timer handling**: Automatic retry when circuit opens
+- **Context-aware**: Respects context timeout as natural retry boundary
+- **Same protection**: Zero-tolerance circuit breaker with all features
+- **Type-safe**: Returns interface{} requiring type assertion
+
+**When to use ExecuteGRPCBlocking:**
+- Background workers, batch jobs, cron tasks
+- Service-to-service calls in non-user-facing contexts
+- When latency from retries is acceptable
+- Context timeout provides sufficient retry control
+
+**When NOT to use:**
+- User-facing request handlers (use Execute() for immediate response)
+- Need custom fallback logic when circuit opens
+- Want fine-grained control over retry behavior per call
+
 ## Code Generation Templates
 
 Use these templates with placeholder substitution for AI code generation.
@@ -1286,45 +1845,66 @@ func (c *{{ServiceName}}Client) {{MethodName}}(ctx context.Context{{PARAMS}}) ({
 }
 ```
 
-### Template 1B: Basic HTTP Client Template (with ExecuteBlocking)
+### Template 1B: HTTP Client Template (with ExecuteHTTPBlocking)
 
-Use this when you want automatic retry on circuit open:
+Use this for HTTP clients in background/batch contexts with automatic retry and intelligent status classification:
 
 ```go
-func (c *{{ServiceName}}Client) {{MethodName}}Blocking(ctx context.Context{{PARAMS}}) ({{RETURN_TYPE}}, error) {
-    req, err := http.NewRequestWithContext(ctx, "{{HTTP_METHOD}}", c.baseURL+"{{PATH}}", {{BODY}})
-    if err != nil {
-        return {{ZERO_VALUE}}, fmt.Errorf("failed to create request: %w", err)
+// GET request template
+func (c *{{ServiceName}}Client) {{MethodName}}(ctx context.Context{{PARAMS}}) ({{RETURN_TYPE}}, error) {
+    // Request factory creates fresh request for each retry
+    requestFactory := func() (*http.Request, error) {
+        return http.NewRequest("{{HTTP_METHOD}}", c.baseURL+"{{PATH}}", nil)
     }
 
-    var resp *http.Response
-    var httpErr error
-
-    err = c.breaker.ExecuteBlocking(ctx, func(ctx context.Context) error {
-        resp, httpErr = c.client.Do(req)
-        if httpErr != nil {
-            return httpErr
-        }
-
-        if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
-            return fmt.Errorf("server error: %d", resp.StatusCode)
-        }
-        return nil
-    })
-
+    // ExecuteHTTPBlocking provides:
+    // - Automatic retry when circuit is open
+    // - Built-in status code classification (408, 429, 5xx retryable)
+    // - Request recreation for each retry
+    resp, err := c.breaker.ExecuteHTTPBlocking(ctx, c.client, requestFactory)
     if err != nil {
         return {{ZERO_VALUE}}, fmt.Errorf("request failed: %w", err)
     }
     defer resp.Body.Close()
 
-    if resp.StatusCode != http.StatusOK {
-        return {{ZERO_VALUE}}, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+    {{DECODE_LOGIC}}
+    return {{RESULT}}, nil
+}
+
+// POST/PUT/PATCH request template with body
+func (c *{{ServiceName}}Client) {{MethodName}}(ctx context.Context, payload {{PAYLOAD_TYPE}}) ({{RETURN_TYPE}}, error) {
+    // Serialize payload once
+    jsonData, err := json.Marshal(payload)
+    if err != nil {
+        return {{ZERO_VALUE}}, fmt.Errorf("failed to marshal payload: %w", err)
     }
+
+    // Request factory creates fresh request with fresh body for each retry
+    requestFactory := func() (*http.Request, error) {
+        req, err := http.NewRequest("{{HTTP_METHOD}}", c.baseURL+"{{PATH}}", bytes.NewBuffer(jsonData))
+        if err != nil {
+            return nil, err
+        }
+        req.Header.Set("Content-Type", "application/json")
+        return req, nil
+    }
+
+    resp, err := c.breaker.ExecuteHTTPBlocking(ctx, c.client, requestFactory)
+    if err != nil {
+        return {{ZERO_VALUE}}, fmt.Errorf("request failed: %w", err)
+    }
+    defer resp.Body.Close()
 
     {{DECODE_LOGIC}}
     return {{RESULT}}, nil
 }
 ```
+
+**Key features:**
+- **Request factory pattern**: Creates fresh request (and body) for each retry
+- **Automatic status classification**: 408, 429, 5xx retryable; other 4xx non-retryable
+- **Response management**: Returns full http.Response, caller closes body
+- **Simplified error handling**: No timer checking needed
 
 ### Template 2: Repository Pattern Template
 
@@ -1448,6 +2028,104 @@ func (w *{{WrapperName}}) Query(ctx context.Context, query string, args ...inter
     return rows, nil
 }
 ```
+
+### Template 4: gRPC Client with ExecuteGRPCBlocking
+
+Use this for gRPC clients in background/batch contexts:
+
+```go
+type {{ServiceName}}Client struct {
+    client  pb.{{ServiceName}}Client
+    breaker circuitbreaker.CircuitBreaker
+}
+
+func New{{ServiceName}}Client(conn *grpc.ClientConn) (*{{ServiceName}}Client, error) {
+    cb, err := circuitbreaker.NewZeroTolerance(
+        circuitbreaker.WithCooldownTimer({{COOLDOWN_SECONDS}} * time.Second),
+        circuitbreaker.WithSuccessToClose({{SUCCESS_COUNT}}),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to create circuit breaker: %w", err)
+    }
+
+    return &{{ServiceName}}Client{
+        client:  pb.New{{ServiceName}}Client(conn),
+        breaker: cb,
+    }, nil
+}
+
+// Unary RPC method template
+func (c *{{ServiceName}}Client) {{MethodName}}(ctx context.Context, {{PARAMS}}) (*pb.{{ResponseType}}, error) {
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.{{MethodName}}(ctx, &pb.{{RequestType}}{
+            {{REQUEST_FIELDS}}
+        })
+    })
+    if err != nil {
+        return nil, fmt.Errorf("{{MethodName}} failed: %w", err)
+    }
+
+    // Type assert the response
+    typedResp := resp.(*pb.{{ResponseType}})
+    return typedResp, nil
+}
+
+// Example with extracted fields
+func (c *{{ServiceName}}Client) GetResource(ctx context.Context, id string) (*pb.Resource, error) {
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.GetResource(ctx, &pb.GetResourceRequest{
+            Id: id,
+        })
+    })
+    if err != nil {
+        return nil, fmt.Errorf("GetResource failed: %w", err)
+    }
+    return resp.(*pb.Resource), nil
+}
+
+// Example with list method
+func (c *{{ServiceName}}Client) ListResources(ctx context.Context, pageSize int32) ([]*pb.Resource, error) {
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.ListResources(ctx, &pb.ListResourcesRequest{
+            PageSize: pageSize,
+        })
+    })
+    if err != nil {
+        return nil, fmt.Errorf("ListResources failed: %w", err)
+    }
+    listResp := resp.(*pb.ListResourcesResponse)
+    return listResp.Resources, nil
+}
+
+// Example with create method
+func (c *{{ServiceName}}Client) CreateResource(ctx context.Context, resource *pb.Resource) (*pb.Resource, error) {
+    resp, err := c.breaker.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return c.client.CreateResource(ctx, &pb.CreateResourceRequest{
+            Resource: resource,
+        })
+    })
+    if err != nil {
+        return nil, fmt.Errorf("CreateResource failed: %w", err)
+    }
+    return resp.(*pb.Resource), nil
+}
+```
+
+**Template substitutions:**
+- `{{ServiceName}}`: The name of the gRPC service (e.g., "User", "Order", "Product")
+- `{{MethodName}}`: The name of the gRPC method (e.g., "GetUser", "ListOrders")
+- `{{PARAMS}}`: Method parameters (e.g., "userID string", "pageSize int32")
+- `{{RequestType}}`: The protobuf request message type
+- `{{ResponseType}}`: The protobuf response message type
+- `{{REQUEST_FIELDS}}`: Field assignments for the request (e.g., "UserId: userID,")
+- `{{COOLDOWN_SECONDS}}`: Circuit breaker cooldown duration in seconds
+- `{{SUCCESS_COUNT}}`: Number of successes required to close circuit
+
+**Key features:**
+- **Clean interface**: 3 lines per method vs 30+ with Execute()
+- **Type assertion required**: Returns interface{}, must type assert result
+- **Automatic retry**: Handles circuit open state transparently
+- **Context-aware**: Respects context timeout as retry boundary
 
 ## Anti-Patterns
 
@@ -1687,6 +2365,100 @@ timer, err := cb.Execute(ctx, func(ctx context.Context) error {
     return nil
 })
 ```
+
+### 6. DO NOT use blocking methods in user-facing request handlers
+
+WRONG:
+```go
+// HTTP handler using ExecuteHTTPBlocking - BLOCKS the request handler!
+func (s *Server) GetUserHandler(w http.ResponseWriter, r *http.Request) {
+    userID := r.URL.Query().Get("id")
+
+    // Request factory for user service call
+    requestFactory := func() (*http.Request, error) {
+        return http.NewRequest("GET", s.userServiceURL+"/users/"+userID, nil)
+    }
+
+    // WRONG: This blocks the HTTP handler thread while waiting for circuit to close
+    // User experiences long delays instead of fast failure
+    resp, err := s.breaker.ExecuteHTTPBlocking(r.Context(), s.client, requestFactory)
+    if err != nil {
+        http.Error(w, "User service unavailable", http.StatusServiceUnavailable)
+        return
+    }
+    defer resp.Body.Close()
+
+    // Copy response to user
+    io.Copy(w, resp.Body)
+}
+```
+
+**Why this is wrong:**
+- Blocks the request handler for up to several minutes while circuit is open
+- User sees hanging requests instead of fast failure
+- Wastes server resources keeping connections open
+- Poor user experience - no immediate feedback
+
+RIGHT:
+```go
+// HTTP handler using Execute() - FAILS FAST
+func (s *Server) GetUserHandler(w http.ResponseWriter, r *http.Request) {
+    userID := r.URL.Query().Get("id")
+
+    req, err := http.NewRequest("GET", s.userServiceURL+"/users/"+userID, nil)
+    if err != nil {
+        http.Error(w, "Invalid request", http.StatusBadRequest)
+        return
+    }
+
+    var resp *http.Response
+    var httpErr error
+
+    // RIGHT: Check timer immediately and fail fast
+    timer, err := s.breaker.Execute(r.Context(), func(ctx context.Context) error {
+        resp, httpErr = s.client.Do(req)
+        if httpErr != nil {
+            return httpErr
+        }
+        if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+            return fmt.Errorf("server error: %d", resp.StatusCode)
+        }
+        return nil
+    })
+
+    if timer != nil {
+        // Circuit is open - return cached data or error immediately
+        cached, err := s.cache.Get("user:" + userID)
+        if err == nil {
+            w.Header().Set("Content-Type", "application/json")
+            w.Header().Set("X-Cache", "HIT")
+            w.Write(cached)
+            return
+        }
+        http.Error(w, "User service unavailable", http.StatusServiceUnavailable)
+        return
+    }
+
+    if err != nil {
+        http.Error(w, "Request failed", http.StatusBadGateway)
+        return
+    }
+    defer resp.Body.Close()
+
+    // Copy response to user
+    io.Copy(w, resp.Body)
+}
+```
+
+**Why this is right:**
+- Returns immediately when circuit is open (fast failure)
+- Provides opportunity for fallback logic (cached data)
+- Good user experience - fast feedback
+- Conserves server resources
+
+**Key principle:**
+- **User-facing contexts**: Use Execute() for immediate response
+- **Background contexts**: Use blocking methods for automatic retry
 
 ## Testing Patterns
 
@@ -1931,6 +2703,224 @@ func TestCircuitBreakerScenarios(t *testing.T) {
 }
 ```
 
+### Pattern 5: Testing ExecuteHTTPBlocking with httptest
+
+```go
+func TestExecuteHTTPBlocking(t *testing.T) {
+    // Track request attempts
+    attempts := 0
+    failuresRemaining := 2
+
+    // Create test server that fails N times then succeeds
+    server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        attempts++
+
+        if failuresRemaining > 0 {
+            failuresRemaining--
+            w.WriteHeader(http.StatusServiceUnavailable)
+            w.Write([]byte("Service temporarily unavailable"))
+            return
+        }
+
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte("Success"))
+    }))
+    defer server.Close()
+
+    // Create circuit breaker with fake clock
+    fakeClock := &FakeClock{now: time.Now()}
+    cb, err := circuitbreaker.NewZeroTolerance(
+        circuitbreaker.WithClock(fakeClock),
+        circuitbreaker.WithCooldownTimer(5 * time.Second),
+        circuitbreaker.WithSuccessToClose(1),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    client := &http.Client{Timeout: 2 * time.Second}
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    // Request factory
+    requestFactory := func() (*http.Request, error) {
+        return http.NewRequest("GET", server.URL, nil)
+    }
+
+    // Start blocking call in goroutine
+    resultChan := make(chan error, 1)
+    go func() {
+        resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+        if err != nil {
+            resultChan <- err
+            return
+        }
+        defer resp.Body.Close()
+
+        body, _ := io.ReadAll(resp.Body)
+        if string(body) != "Success" {
+            resultChan <- fmt.Errorf("unexpected body: %s", string(body))
+            return
+        }
+        resultChan <- nil
+    }()
+
+    // Advance time to allow retries when circuit opens
+    go func() {
+        for i := 0; i < 5; i++ {
+            time.Sleep(100 * time.Millisecond)
+            fakeClock.Advance(6 * time.Second)
+        }
+    }()
+
+    // Wait for result
+    select {
+    case err := <-resultChan:
+        if err != nil {
+            t.Errorf("ExecuteHTTPBlocking failed: %v", err)
+        }
+        if attempts < 3 {
+            t.Errorf("Expected at least 3 attempts, got %d", attempts)
+        }
+    case <-time.After(5 * time.Second):
+        t.Error("Test timeout - ExecuteHTTPBlocking blocked indefinitely")
+    }
+}
+```
+
+### Pattern 6: Testing ExecuteGRPCBlocking with Mock
+
+```go
+// Mock gRPC client for testing
+type MockUserServiceClient struct {
+    attempts          int
+    failuresRemaining int
+}
+
+func (m *MockUserServiceClient) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
+    m.attempts++
+
+    if m.failuresRemaining > 0 {
+        m.failuresRemaining--
+        return nil, fmt.Errorf("gRPC service unavailable")
+    }
+
+    return &pb.User{
+        Id:    req.UserId,
+        Name:  "Test User",
+        Email: "test@example.com",
+    }, nil
+}
+
+func TestExecuteGRPCBlocking(t *testing.T) {
+    // Create circuit breaker with fake clock
+    fakeClock := &FakeClock{now: time.Now()}
+    cb, err := circuitbreaker.NewZeroTolerance(
+        circuitbreaker.WithClock(fakeClock),
+        circuitbreaker.WithCooldownTimer(5 * time.Second),
+        circuitbreaker.WithSuccessToClose(1),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    // Create mock client that fails 2 times then succeeds
+    mockClient := &MockUserServiceClient{
+        failuresRemaining: 2,
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    // Start blocking call in goroutine
+    resultChan := make(chan error, 1)
+    go func() {
+        resp, err := cb.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+            return mockClient.GetUser(ctx, &pb.GetUserRequest{UserId: "user-123"})
+        })
+        if err != nil {
+            resultChan <- err
+            return
+        }
+
+        // Type assert the response
+        user := resp.(*pb.User)
+        if user.Id != "user-123" {
+            resultChan <- fmt.Errorf("unexpected user ID: %s", user.Id)
+            return
+        }
+        if user.Name != "Test User" {
+            resultChan <- fmt.Errorf("unexpected user name: %s", user.Name)
+            return
+        }
+        resultChan <- nil
+    }()
+
+    // Advance time to allow retries when circuit opens
+    go func() {
+        for i := 0; i < 5; i++ {
+            time.Sleep(100 * time.Millisecond)
+            fakeClock.Advance(6 * time.Second)
+        }
+    }()
+
+    // Wait for result
+    select {
+    case err := <-resultChan:
+        if err != nil {
+            t.Errorf("ExecuteGRPCBlocking failed: %v", err)
+        }
+        if mockClient.attempts < 3 {
+            t.Errorf("Expected at least 3 attempts, got %d", mockClient.attempts)
+        }
+    case <-time.After(5 * time.Second):
+        t.Error("Test timeout - ExecuteGRPCBlocking blocked indefinitely")
+    }
+}
+
+// Test context timeout with blocking methods
+func TestExecuteGRPCBlockingContextTimeout(t *testing.T) {
+    fakeClock := &FakeClock{now: time.Now()}
+    cb, err := circuitbreaker.NewZeroTolerance(
+        circuitbreaker.WithClock(fakeClock),
+        circuitbreaker.WithCooldownTimer(5 * time.Second),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    // Mock client that always fails
+    mockClient := &MockUserServiceClient{
+        failuresRemaining: 1000, // Never succeeds
+    }
+
+    // Short context timeout
+    ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+    defer cancel()
+
+    // Should return error due to context timeout
+    _, err = cb.ExecuteGRPCBlocking(ctx, func(ctx context.Context) (interface{}, error) {
+        return mockClient.GetUser(ctx, &pb.GetUserRequest{UserId: "user-123"})
+    })
+
+    if err == nil {
+        t.Error("Expected context timeout error, got nil")
+    }
+
+    if !strings.Contains(err.Error(), "context") {
+        t.Errorf("Expected context error, got: %v", err)
+    }
+}
+```
+
+**Key testing principles for blocking methods:**
+
+1. **Use goroutines**: Launch blocking calls in goroutines to avoid blocking test execution
+2. **Advance FakeClock**: Manually advance time to trigger circuit transitions
+3. **Context timeout**: Always use context timeout as safety net
+4. **Verify attempts**: Check that retries actually occurred
+5. **Test timeout boundary**: Verify blocking respects context deadline
+
 ### FakeClock Implementation
 
 Always use this FakeClock for testing:
@@ -1956,10 +2946,20 @@ func (f *FakeClock) Advance(d time.Duration) { f.now = f.now.Add(d) }
 When integrating circuit breaker into a codebase, verify:
 
 - [ ] Circuit breaker initialized with appropriate configuration for service criticality
+- [ ] Appropriate execution method chosen (Execute vs ExecuteBlocking vs ExecuteHTTPBlocking vs ExecuteGRPCBlocking)
+- [ ] Execute() used for user-facing requests (APIs, web handlers) with immediate fallback
+- [ ] ExecuteHTTPBlocking() used for HTTP clients in background/batch contexts
+- [ ] ExecuteGRPCBlocking() used for gRPC clients in background/batch contexts
+- [ ] ExecuteBlocking() used for generic operations in background/batch contexts
+- [ ] Blocking methods NOT used in user-facing request handlers
 - [ ] Circuit open condition is handled with proper fallback strategy (cache, default value, or meaningful error)
 - [ ] Error classification is correct (return error from Execute function to mark as failure)
 - [ ] Circuit breaker is NOT shared across unrelated services
+- [ ] Request factory functions create fresh requests for each retry (when using ExecuteHTTPBlocking)
+- [ ] Type assertions applied correctly to gRPC responses (when using ExecuteGRPCBlocking)
+- [ ] Context timeout set appropriately to limit retry duration (when using blocking methods)
 - [ ] Tests include `FakeClock` usage for time-dependent behavior
+- [ ] Tests for blocking methods run in goroutines with timeout safety
 - [ ] Monitoring/logging added to track circuit breaker state transitions
 - [ ] Documentation updated to explain circuit breaker behavior
 - [ ] Only wrapping external dependencies (HTTP, database, RPC), not pure functions
