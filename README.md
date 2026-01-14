@@ -67,6 +67,29 @@ func callUpstream() error {
 }
 ```
 
+## Blocking execution
+
+For simpler usage when you want to automatically wait when the circuit is open, use `ExecuteBlocking`:
+
+```go
+cb, _ := circuitbreaker.New()
+
+// ExecuteBlocking automatically waits when circuit is open
+// and returns when the function succeeds or the context is cancelled
+err := cb.ExecuteBlocking(context.Background(), func(ctx context.Context) error {
+	return callUpstream()
+})
+
+if err != nil {
+	// Either the operation failed or context was cancelled
+	panic(err)
+}
+```
+
+The difference:
+- `Execute()` returns `(*time.Timer, error)` - you handle the timer
+- `ExecuteBlocking()` returns `error` - automatically waits on timer, respects context cancellation
+
 ## HTTP usage
 
 See `examples/http_client/main.go` for a complete HTTP client example. The Execute method wraps HTTP requests:

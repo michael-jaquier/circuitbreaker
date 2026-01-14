@@ -100,3 +100,40 @@ clean:
 
 .PHONY: all
 all: lint test build
+
+.PHONY: get-version
+get-version:
+	@git tag -l "v*.*.*" | sort -V | tail -n1 || echo "v0.0.0"
+
+.PHONY: patch
+patch:
+	@current=$$(git tag -l "v*.*.*" | sort -V | tail -n1); \
+	if [ -z "$$current" ]; then current="v0.0.0"; fi; \
+	version=$${current#v}; \
+	IFS='.' read -r major minor patch <<< "$$version"; \
+	new_patch=$$((patch + 1)); \
+	new_tag="v$$major.$$minor.$$new_patch"; \
+	echo "Bumping $$current -> $$new_tag"; \
+	git tag $$new_tag && echo "Tagged $$new_tag"
+
+.PHONY: minor
+minor:
+	@current=$$(git tag -l "v*.*.*" | sort -V | tail -n1); \
+	if [ -z "$$current" ]; then current="v0.0.0"; fi; \
+	version=$${current#v}; \
+	IFS='.' read -r major minor patch <<< "$$version"; \
+	new_minor=$$((minor + 1)); \
+	new_tag="v$$major.$$new_minor.0"; \
+	echo "Bumping $$current -> $$new_tag"; \
+	git tag $$new_tag && echo "Tagged $$new_tag"
+
+.PHONY: major
+major:
+	@current=$$(git tag -l "v*.*.*" | sort -V | tail -n1); \
+	if [ -z "$$current" ]; then current="v0.0.0"; fi; \
+	version=$${current#v}; \
+	IFS='.' read -r major minor patch <<< "$$version"; \
+	new_major=$$((major + 1)); \
+	new_tag="v$$new_major.0.0"; \
+	echo "Bumping $$current -> $$new_tag"; \
+	git tag $$new_tag && echo "Tagged $$new_tag"

@@ -3,6 +3,8 @@ package circuitbreaker
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -15,18 +17,32 @@ var AllOptions = []string{
 }
 
 type FakeClock struct {
+	mu  sync.RWMutex
 	now time.Time
 }
 
-func (f *FakeClock) Now() time.Time        { return f.now }
+func (f *FakeClock) Now() time.Time {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.now
+}
+
 func (f *FakeClock) Sleep(d time.Duration) { f.Advance(d) }
+
 func (f *FakeClock) After(d time.Duration) <-chan time.Time {
 	f.Advance(d)
 	ch := make(chan time.Time, 1)
+	f.mu.RLock()
 	ch <- f.now
+	f.mu.RUnlock()
 	return ch
 }
-func (f *FakeClock) Advance(d time.Duration) { f.now = f.now.Add(d) }
+
+func (f *FakeClock) Advance(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.now = f.now.Add(d)
+}
 
 func TestZeroToleranceMode(t *testing.T) {
 	tests := []struct {
@@ -265,5 +281,195 @@ func TestZeroToleranceHalfOpenSingleFailureReopens(t *testing.T) {
 
 	if State(ztcb.state.Load()) != Open {
 		t.Errorf("Should be open after 1 failure in half-open (zero tolerance), got %v", State(ztcb.state.Load()))
+	}
+}
+
+func TestExecuteBlockingSuccess(t *testing.T) {
+	fakeClock := &FakeClock{now: time.Now()}
+	cb, err := NewZeroTolerance(WithClock(fakeClock))
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	ctx := context.Background()
+	executed := false
+
+	err = cb.ExecuteBlocking(ctx, func(ctx context.Context) error {
+		executed = true
+		return nil
+	})
+
+	if err != nil {
+		t.Errorf("ExecuteBlocking should succeed when circuit is closed, got error: %v", err)
+	}
+
+	if !executed {
+		t.Error("Function should have been executed")
+	}
+}
+
+func TestExecuteBlockingReturnsError(t *testing.T) {
+	fakeClock := &FakeClock{now: time.Now()}
+	cb, err := NewZeroTolerance(WithClock(fakeClock))
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	ctx := context.Background()
+	expectedErr := errors.New("function error")
+
+	err = cb.ExecuteBlocking(ctx, func(ctx context.Context) error {
+		return expectedErr
+	})
+
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("ExecuteBlocking should return function error, got: %v", err)
+	}
+}
+
+func TestExecuteBlockingWaitsWhenCircuitOpen(t *testing.T) {
+	// Use short real time delay for this test since ExecuteBlocking waits on real timers
+	cb, err := NewZeroTolerance(
+		WithCooldownTimer(100*time.Millisecond),
+		WithSuccessToClose(1),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	// Open the circuit
+	cb.Execute(context.Background(), func(ctx context.Context) error {
+		return errors.New("open circuit")
+	})
+
+	ztcb := cb.(*circuitBreaker)
+	if State(ztcb.state.Load()) != Open {
+		t.Fatal("Circuit should be open")
+	}
+
+	// Start ExecuteBlocking in background
+	done := make(chan error, 1)
+	var executionCount atomic.Int32
+
+	startTime := time.Now()
+	go func() {
+		err := cb.ExecuteBlocking(context.Background(), func(ctx context.Context) error {
+			executionCount.Add(1)
+			return nil
+		})
+		done <- err
+	}()
+
+	// Give goroutine time to start and hit the timer wait
+	time.Sleep(10 * time.Millisecond)
+
+	// Verify function hasn't executed yet (circuit is open)
+	if executionCount.Load() != 0 {
+		t.Error("Function should not execute while circuit is open")
+	}
+
+	// Wait for ExecuteBlocking to complete (should wait for cooldown, then execute)
+	select {
+	case err := <-done:
+		elapsed := time.Since(startTime)
+		if err != nil {
+			t.Errorf("ExecuteBlocking should succeed after cooldown, got error: %v", err)
+		}
+		if executionCount.Load() != 1 {
+			t.Errorf("Function should execute once, executed %d times", executionCount.Load())
+		}
+		// Verify it actually waited for the cooldown period
+		if elapsed < 100*time.Millisecond {
+			t.Errorf("ExecuteBlocking should wait for cooldown (~100ms), completed in %v", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ExecuteBlocking did not complete after cooldown")
+	}
+}
+
+func TestExecuteBlockingContextCancellation(t *testing.T) {
+	fakeClock := &FakeClock{now: time.Now()}
+	cb, err := NewZeroTolerance(
+		WithClock(fakeClock),
+		WithCooldownTimer(60*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	// Open the circuit
+	cb.Execute(context.Background(), func(ctx context.Context) error {
+		return errors.New("open circuit")
+	})
+
+	ztcb := cb.(*circuitBreaker)
+	if State(ztcb.state.Load()) != Open {
+		t.Fatal("Circuit should be open")
+	}
+
+	// Create context with short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// ExecuteBlocking should return context error
+	err = cb.ExecuteBlocking(ctx, func(ctx context.Context) error {
+		return nil
+	})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Expected context.DeadlineExceeded, got: %v", err)
+	}
+}
+
+func TestExecuteBlockingEventualSuccess(t *testing.T) {
+	// Test that ExecuteBlocking waits through multiple open->halfopen cycles until success
+	cb, err := NewZeroTolerance(
+		WithCooldownTimer(50*time.Millisecond),
+		WithSuccessToClose(1),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	// Open the circuit
+	_, _ = cb.Execute(context.Background(), func(ctx context.Context) error {
+		return errors.New("open circuit")
+	})
+
+	// Track execution attempts
+	var attemptCount atomic.Int32
+	done := make(chan error, 1)
+
+	// Simulate a service that fails twice then succeeds
+	externalServiceCallCount := 0
+	simulateExternalService := func() error {
+		externalServiceCallCount++
+		if externalServiceCallCount <= 2 {
+			return errors.New("service unavailable")
+		}
+		return nil
+	}
+
+	go func() {
+		err := cb.ExecuteBlocking(context.Background(), func(ctx context.Context) error {
+			attemptCount.Add(1)
+			return simulateExternalService()
+		})
+		done <- err
+	}()
+
+	// Wait for completion or timeout
+	select {
+	case err := <-done:
+		// ExecuteBlocking returns immediately on first function error
+		// It only retries when circuit is open (not on function errors)
+		if err == nil {
+			t.Error("Expected error from first attempt, got nil")
+		}
+		if attemptCount.Load() != 1 {
+			t.Errorf("ExecuteBlocking should only try once (returns on function error), got %d attempts", attemptCount.Load())
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ExecuteBlocking did not return")
 	}
 }
