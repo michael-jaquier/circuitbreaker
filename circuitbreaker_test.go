@@ -1,6 +1,8 @@
 package circuitbreaker
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -47,7 +49,9 @@ func TestZeroToleranceMode(t *testing.T) {
 			name: "opens_after_single_failure",
 			setupActions: func(cb CircuitBreaker, clock *FakeClock) {
 				// Zero tolerance: 1 failure = open
-				cb.ReportFailure()
+				cb.Execute(context.Background(), func(ctx context.Context) error {
+					return errors.New("simulated failure")
+				})
 			},
 			expectedState: Open,
 			expectedAllow: false,
@@ -56,7 +60,9 @@ func TestZeroToleranceMode(t *testing.T) {
 		{
 			name: "blocks_requests_when_open",
 			setupActions: func(cb CircuitBreaker, clock *FakeClock) {
-				cb.ReportFailure()
+				cb.Execute(context.Background(), func(ctx context.Context) error {
+					return errors.New("simulated failure")
+				})
 			},
 			expectedState: Open,
 			expectedAllow: false,
@@ -65,7 +71,11 @@ func TestZeroToleranceMode(t *testing.T) {
 		{
 			name: "transitions_to_halfopen_after_cooldown",
 			setupActions: func(cb CircuitBreaker, clock *FakeClock) {
-				cb.ReportFailure()
+				// Open the circuit
+				cb.Execute(context.Background(), func(ctx context.Context) error {
+					return errors.New("simulated failure")
+				})
+				// Advance past cooldown - transition happens lazily in next allow() call
 				clock.Advance(121 * time.Second) // Cooldown is 120s
 			},
 			expectedState: HalfOpen,
@@ -75,8 +85,11 @@ func TestZeroToleranceMode(t *testing.T) {
 		{
 			name: "halfopen_allows_limited_probes",
 			setupActions: func(cb CircuitBreaker, clock *FakeClock) {
-				cb.ReportFailure()
+				cb.Execute(context.Background(), func(ctx context.Context) error {
+					return errors.New("simulated failure")
+				})
 				clock.Advance(121 * time.Second)
+				// Next Execute() triggers lazy Open→HalfOpen transition via CAS in allow()
 			},
 			expectedState: HalfOpen,
 			expectedAllow: true,
@@ -85,11 +98,15 @@ func TestZeroToleranceMode(t *testing.T) {
 		{
 			name: "closes_after_sufficient_successes",
 			setupActions: func(cb CircuitBreaker, clock *FakeClock) {
-				cb.ReportFailure()
+				cb.Execute(context.Background(), func(ctx context.Context) error {
+					return errors.New("simulated failure")
+				})
 				clock.Advance(121 * time.Second)
-				cb.Request() // Move to half-open
+				// Report 5 successes to close the circuit
 				for range 5 {
-					cb.ReportSuccess()
+					cb.Execute(context.Background(), func(ctx context.Context) error {
+						return nil // Success
+					})
 				}
 			},
 			expectedState: Closed,
@@ -99,9 +116,11 @@ func TestZeroToleranceMode(t *testing.T) {
 		{
 			name: "stays_open_during_cooldown",
 			setupActions: func(cb CircuitBreaker, clock *FakeClock) {
-				cb.ReportFailure()
+				cb.Execute(context.Background(), func(ctx context.Context) error {
+					return errors.New("simulated failure")
+				})
 				clock.Advance(60 * time.Second) // Half of cooldown period
-				cb.Request()
+				// Circuit stays Open because allow() checks halfOpenAt time
 			},
 			expectedState: Open,
 			expectedAllow: false,
@@ -119,14 +138,18 @@ func TestZeroToleranceMode(t *testing.T) {
 
 			tt.setupActions(cb, fakeClock)
 
-			allowed, waitTime := cb.Request()
+			// Test if circuit allows requests by attempting an Execute
+			timer, _ := cb.Execute(context.Background(), func(ctx context.Context) error {
+				return nil // Test operation
+			})
+			allowed := (timer == nil)
 
 			if allowed != tt.expectedAllow {
-				t.Errorf("%s: expected allowed=%v, got %v (wait=%v)",
-					tt.description, tt.expectedAllow, allowed, waitTime)
+				t.Errorf("%s: expected allowed=%v, got %v",
+					tt.description, tt.expectedAllow, allowed)
 			}
 
-			ztcb := cb.(*zeroToleranceCircuitBreaker)
+			ztcb := cb.(*circuitBreaker)
 			actualState := State(ztcb.state.Load())
 
 			if actualState != tt.expectedState {
@@ -145,20 +168,23 @@ func TestZeroToleranceProbeExhaustion(t *testing.T) {
 	}
 
 	// Open the circuit
-	cb.ReportFailure()
+	cb.Execute(context.Background(), func(ctx context.Context) error {
+		return errors.New("simulated failure")
+	})
 
 	// Advance past cooldown to half-open
 	fakeClock.Advance(121 * time.Second)
 
-	ztcb := cb.(*zeroToleranceCircuitBreaker)
+	ztcb := cb.(*circuitBreaker)
 
-	initialProbes := int64(1)
+	// Sequential requests should succeed because probes are released after completion
 	allowedCount := 0
 
-	// Try to acquire more probes than available
-	for i := int64(0); i < initialProbes+1; i++ {
-		allowed, _ := cb.Request()
-		if allowed {
+	for i := 0; i < 2; i++ {
+		timer, _ := cb.Execute(context.Background(), func(ctx context.Context) error {
+			return nil // Test operation
+		})
+		if timer == nil {
 			allowedCount++
 		}
 	}
@@ -167,13 +193,9 @@ func TestZeroToleranceProbeExhaustion(t *testing.T) {
 		t.Errorf("Circuit should still be half-open, got %v", State(ztcb.state.Load()))
 	}
 
-	if allowedCount != int(initialProbes) {
-		t.Errorf("Expected %d probes to be allowed, got %d", initialProbes, allowedCount)
-	}
-
-	remainingProbes := ztcb.probes.Load()
-	if remainingProbes != 0 {
-		t.Errorf("Expected 0 probes remaining, got %d", remainingProbes)
+	// Both sequential requests should succeed since probes are reusable
+	if allowedCount != 2 {
+		t.Errorf("Expected 2 probes to be allowed sequentially, got %d", allowedCount)
 	}
 }
 
@@ -185,21 +207,24 @@ func TestZeroToleranceProbeReleaseOnSuccess(t *testing.T) {
 	}
 
 	// Open the circuit
-	cb.ReportFailure()
+	cb.Execute(context.Background(), func(ctx context.Context) error {
+		return errors.New("simulated failure")
+	})
 
 	// Advance past cooldown to half-open
 	fakeClock.Advance(121 * time.Second)
 
-	ztcb := cb.(*zeroToleranceCircuitBreaker)
+	ztcb := cb.(*circuitBreaker)
 
 	// With maximumProbes=1 and successToClose=5, we need probe release to work
 	successCount := 0
 	for successCount < int(ztcb.config.successToClose) {
-		allowed, _ := cb.Request()
-		if !allowed {
+		timer, _ := cb.Execute(context.Background(), func(ctx context.Context) error {
+			return nil // Success
+		})
+		if timer != nil {
 			t.Fatalf("Request %d was blocked, probes not being released properly", successCount+1)
 		}
-		cb.ReportSuccess()
 		successCount++
 
 		// Verify still in half-open until we hit successToClose
@@ -214,11 +239,6 @@ func TestZeroToleranceProbeReleaseOnSuccess(t *testing.T) {
 	if State(ztcb.state.Load()) != Closed {
 		t.Errorf("After %d successes, should be closed, got %v", successCount, State(ztcb.state.Load()))
 	}
-
-	// Probes should be reset to maximum
-	if ztcb.probes.Load() != ztcb.config.maximumProbes {
-		t.Errorf("Expected probes to be reset to %d, got %d", ztcb.config.maximumProbes, ztcb.probes.Load())
-	}
 }
 
 func TestZeroToleranceHalfOpenSingleFailureReopens(t *testing.T) {
@@ -229,21 +249,19 @@ func TestZeroToleranceHalfOpenSingleFailureReopens(t *testing.T) {
 	}
 
 	// Open the circuit
-	cb.ReportFailure()
+	cb.Execute(context.Background(), func(ctx context.Context) error {
+		return errors.New("simulated failure")
+	})
 
 	// Advance past cooldown to half-open
 	fakeClock.Advance(121 * time.Second)
 
-	ztcb := cb.(*zeroToleranceCircuitBreaker)
-
-	// First request in half-open
-	allowed, _ := cb.Request()
-	if !allowed {
-		t.Fatal("First request should be allowed in half-open")
-	}
+	ztcb := cb.(*circuitBreaker)
 
 	// Zero tolerance: single failure in half-open immediately reopens
-	cb.ReportFailure()
+	cb.Execute(context.Background(), func(ctx context.Context) error {
+		return errors.New("simulated failure in half-open")
+	})
 
 	if State(ztcb.state.Load()) != Open {
 		t.Errorf("Should be open after 1 failure in half-open (zero tolerance), got %v", State(ztcb.state.Load()))

@@ -4,11 +4,12 @@ Small Go library implementing the Circuit Breaker pattern, with a focus on simpl
 
 Repository layout (main branch):
 - `circuitbreaker.go`: core circuit breaker implementation
-- `circuitbreaker_zerotolerance.go`: “zero tolerance” variant
+- `options.go`: configuration options for circuit breakers
+- `clock.go`: clock interface for testing
 - `circuitbreaker_http_test.go`: HTTP-focused tests / examples
 - `circuitbreaker_test.go`: core unit tests
 - `Makefile`: common dev targets
-- `go.mod` / `go.sum`: Go module metadata :contentReference[oaicite:0]{index=0}
+- `go.mod` / `go.sum`: Go module metadata
 
 ## What this is for
 
@@ -20,14 +21,13 @@ If you are using Go modules:
 
 ```bash
 go get github.com/michael-jaquier/circuitbreaker
-Basic usage
-Import the package and wrap the call you want to protect (usually a remote call). The package is designed to be small and test-driven (see *_test.go). 
-GitHub
+```
 
-Example shape (adapt names to the exported API in circuitbreaker.go):
+## Basic usage
 
-go
-Copy code
+Import the package and wrap the call you want to protect (usually a remote call):
+
+```go
 package main
 
 import (
@@ -41,45 +41,84 @@ import (
 var ErrUpstreamDown = errors.New("upstream unavailable")
 
 func main() {
-	_ = time.Second
+	// Create breaker with default config
+	cb, err := circuitbreaker.New()
+	if err != nil {
+		panic(err)
+	}
 
-	// cb := circuitbreaker.New(...)         // create breaker with config
-	// result, err := cb.Do(func() error {   // execute protected call
-	//     return callUpstream()
-	// })
-	// if err != nil { ... }
+	// Execute protected call
+	timer, err := cb.Execute(context.Background(), func(ctx context.Context) error {
+		return callUpstream()
+	})
+
+	if timer != nil {
+		// Circuit is open, service unavailable
+		panic("circuit breaker is open")
+	}
+	if err != nil {
+		// Operation failed
+		panic(err)
+	}
 }
 
 func callUpstream() error {
 	return ErrUpstreamDown
 }
-HTTP usage
-This repo includes HTTP-oriented tests (circuitbreaker_http_test.go). Use that as the reference for:
+```
 
-wrapping an http.RoundTripper, http.Client, or handler/middleware
+## HTTP usage
 
-classifying which status codes / errors should count as failures 
-GitHub
+See `examples/http_client/main.go` for a complete HTTP client example. The Execute method wraps HTTP requests:
 
-Zero-tolerance mode
-The repo contains a dedicated implementation file for a “zero tolerance” breaker (circuitbreaker_zerotolerance.go). This is typically useful when any failure should open the circuit immediately (for example, hard dependencies during startup paths). 
-GitHub
+```go
+var resp *http.Response
+var httpErr error
 
-Development
-Common targets are in Makefile. Typical workflow:
+timer, err := cb.Execute(req.Context(), func(ctx context.Context) error {
+    client := &http.Client{Timeout: 10 * time.Second}
+    resp, httpErr = client.Do(req)
+    if httpErr != nil {
+        return httpErr
+    }
 
-bash
-Copy code
+    // Classify which status codes count as failures
+    if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+        return fmt.Errorf("server error: %d", resp.StatusCode)
+    }
+    return nil
+})
+
+if timer != nil {
+    return nil, circuitbreaker.ErrCircuitOpen
+}
+```
+
+## Zero-tolerance mode
+
+Use `NewZeroTolerance()` to create a circuit breaker where any single failure opens the circuit immediately:
+
+```go
+cb, err := circuitbreaker.NewZeroTolerance(
+    circuitbreaker.WithCooldownTimer(60 * time.Second),
+    circuitbreaker.WithSuccessToClose(5),
+)
+```
+
+This is a convenience constructor that sets `failureThreshold=1`. Useful for hard dependencies during startup paths where any failure should immediately stop requests.
+
+## Development
+
+Run tests:
+
+```bash
 go test ./...
-If the Makefile defines test, lint, or fmt, prefer those for consistency. 
-GitHub
+```
 
-Contributing
-Keep behavior covered by unit tests (circuitbreaker_test.go, circuitbreaker_http_test.go).
+## Contributing
 
-Prefer small changes with clear failure-mode tests. 
-GitHub
+Keep behavior covered by unit tests (circuitbreaker_test.go, circuitbreaker_http_test.go). Prefer small changes with clear failure-mode tests.
 
-License
-GPL-3.0. See LICENSE. 
-GitHub
+## License
+
+GPL-3.0. See LICENSE.

@@ -21,6 +21,12 @@ cover.html
 # Build artifacts
 bin/
 
+# Example binaries
+examples/http_client/http_client
+examples/database/database
+examples/grpc_service/grpc_service
+examples/repository_pattern/repository_pattern
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
