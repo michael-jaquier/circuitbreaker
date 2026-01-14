@@ -303,6 +303,72 @@ func main() {
 	}
 	fmt.Println()
 
+	// Example with ExecuteHTTPBlocking (simplified API with automatic retry)
+	fmt.Println("=== Example 6: ExecuteHTTPBlocking (Simplified API) ===")
+	simpleClient, _ := NewAPIClient(APIClientConfig{
+		BaseURL:        "https://jsonplaceholder.typicode.com",
+		Timeout:        10 * time.Second,
+		CooldownTimer:  3 * time.Second,
+		SuccessToClose: 1,
+	})
+
+	// Request factory for GET
+	getRequestFactory := func() (*http.Request, error) {
+		return http.NewRequest("GET", simpleClient.baseURL+"/posts/1", nil)
+	}
+
+	resp, err := simpleClient.breaker.ExecuteHTTPBlocking(
+		context.Background(),
+		simpleClient.client,
+		getRequestFactory,
+	)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("Success! Received %d bytes\n", len(body))
+		fmt.Println("ExecuteHTTPBlocking automatically handles:")
+		fmt.Println("- Request body replay for POST/PUT/PATCH")
+		fmt.Println("- Retryable vs non-retryable error classification")
+		fmt.Println("- Circuit breaker integration with automatic waiting")
+	}
+	fmt.Println()
+
+	// Example with POST using ExecuteHTTPBlocking
+	fmt.Println("=== Example 7: POST with ExecuteHTTPBlocking ===")
+	payload2 := map[string]interface{}{
+		"title":  "Circuit Breaker Test",
+		"body":   "Testing ExecuteHTTPBlocking with POST",
+		"userId": 1,
+	}
+	jsonData2, _ := json.Marshal(payload2)
+
+	// Request factory for POST - creates fresh request each retry
+	postRequestFactory := func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", simpleClient.baseURL+"/posts", bytes.NewBuffer(jsonData2))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}
+
+	resp, err = simpleClient.breaker.ExecuteHTTPBlocking(
+		context.Background(),
+		simpleClient.client,
+		postRequestFactory,
+	)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("Success! Received %d bytes\n", len(body))
+		fmt.Println("Request factory pattern enables body replay on retry")
+	}
+	fmt.Println()
+
 	fmt.Println("=== Circuit Breaker Integration Complete ===")
 	fmt.Println("Key takeaways:")
 	fmt.Println("1. Circuit opens on network errors and 5xx server errors")
@@ -310,4 +376,8 @@ func main() {
 	fmt.Println("3. Execute() fails fast with timer when circuit is open")
 	fmt.Println("4. ExecuteBlocking() automatically waits when circuit is open")
 	fmt.Println("5. Circuit recovers after cooldown period with successful probes")
+	fmt.Println("6. ExecuteHTTPBlocking provides simplified API with automatic:")
+	fmt.Println("   - HTTP error classification (408, 429, 5xx retryable)")
+	fmt.Println("   - Request body replay via factory pattern")
+	fmt.Println("   - Response body management")
 }

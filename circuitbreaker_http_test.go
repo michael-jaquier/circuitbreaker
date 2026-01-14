@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -534,5 +536,332 @@ func TestHttpRequest_2xxSuccessCodes(t *testing.T) {
 				t.Errorf("Circuit should remain closed after %d success, got %v", tc.statusCode, State(ztcb.state.Load()))
 			}
 		})
+	}
+}
+func TestExecuteHTTPBlocking_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("success"))
+	}))
+	defer server.Close()
+
+	cb, err := NewZeroTolerance()
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	client := &http.Client{}
+	requestFactory := func() (*http.Request, error) {
+		return http.NewRequest("GET", server.URL, nil)
+	}
+
+	ctx := context.Background()
+	resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+
+	if err != nil {
+		t.Errorf("Expected no error, got %v", err)
+	}
+	if resp == nil {
+		t.Fatal("Expected response, got nil")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "success" {
+		t.Errorf("Expected body 'success', got %s", string(body))
+	}
+}
+
+func TestExecuteHTTPBlocking_Retryable5xx(t *testing.T) {
+	attempt := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("server error"))
+		} else {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("success"))
+		}
+	}))
+	defer server.Close()
+
+	// Use real time with short cooldown for integration test
+	cb, err := NewZeroTolerance(WithCooldownTimer(100 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	client := &http.Client{}
+	requestFactory := func() (*http.Request, error) {
+		return http.NewRequest("GET", server.URL, nil)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+
+	if err != nil {
+		t.Errorf("Expected no error after retry, got %v", err)
+	}
+	if resp == nil {
+		t.Fatal("Expected response, got nil")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200 after retry, got %d", resp.StatusCode)
+	}
+
+	if attempt != 2 {
+		t.Errorf("Expected 2 attempts, got %d", attempt)
+	}
+}
+
+func TestExecuteHTTPBlocking_Retryable429(t *testing.T) {
+	attempt := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte("rate limited"))
+		} else {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("success"))
+		}
+	}))
+	defer server.Close()
+
+	cb, err := NewZeroTolerance(WithCooldownTimer(100 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	client := &http.Client{}
+	requestFactory := func() (*http.Request, error) {
+		return http.NewRequest("GET", server.URL, nil)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+
+	if err != nil {
+		t.Errorf("Expected no error after retry, got %v", err)
+	}
+	if resp == nil {
+		t.Fatal("Expected response, got nil")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200 after retry, got %d", resp.StatusCode)
+	}
+}
+
+func TestExecuteHTTPBlocking_Retryable408(t *testing.T) {
+	attempt := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt == 1 {
+			w.WriteHeader(http.StatusRequestTimeout)
+			w.Write([]byte("timeout"))
+		} else {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("success"))
+		}
+	}))
+	defer server.Close()
+
+	cb, err := NewZeroTolerance(WithCooldownTimer(100 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	client := &http.Client{}
+	requestFactory := func() (*http.Request, error) {
+		return http.NewRequest("GET", server.URL, nil)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+
+	if err != nil {
+		t.Errorf("Expected no error after retry, got %v", err)
+	}
+	if resp == nil {
+		t.Fatal("Expected response, got nil")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200 after retry, got %d", resp.StatusCode)
+	}
+}
+
+func TestExecuteHTTPBlocking_NonRetryable4xx(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("not found"))
+	}))
+	defer server.Close()
+
+	cb, err := NewZeroTolerance()
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	client := &http.Client{}
+	requestFactory := func() (*http.Request, error) {
+		return http.NewRequest("GET", server.URL, nil)
+	}
+
+	ctx := context.Background()
+	resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+
+	if err == nil {
+		t.Error("Expected non-retryable error, got nil")
+	} else if !errors.Is(err, fmt.Errorf("non-retryable HTTP error: status 404")) &&
+		err.Error() != "non-retryable HTTP error: status 404" {
+		t.Errorf("Expected non-retryable error, got %v", err)
+	}
+
+	if resp == nil {
+		t.Error("Expected response even for 4xx, got nil")
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected status 404, got %d", resp.StatusCode)
+		}
+	}
+
+	if callCount != 1 {
+		t.Errorf("Expected 1 call for non-retryable error, got %d", callCount)
+	}
+}
+
+func TestExecuteHTTPBlocking_OverallContextTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	// Long cooldown means circuit will be open longer than context timeout
+	cb, err := NewZeroTolerance(WithCooldownTimer(5 * time.Second))
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	client := &http.Client{}
+	requestFactory := func() (*http.Request, error) {
+		return http.NewRequest("GET", server.URL, nil)
+	}
+
+	// Short context timeout - will expire while waiting for circuit to close
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+
+	if err == nil {
+		t.Error("Expected context deadline exceeded error, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Expected context.DeadlineExceeded, got %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+		t.Error("Expected nil response on context timeout")
+	}
+}
+
+func TestExecuteHTTPBlocking_RequestFactoryError(t *testing.T) {
+	cb, err := NewZeroTolerance()
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	client := &http.Client{}
+	expectedErr := fmt.Errorf("factory error")
+	requestFactory := func() (*http.Request, error) {
+		return nil, expectedErr
+	}
+
+	ctx := context.Background()
+	resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+
+	if err == nil {
+		t.Fatal("Expected error from factory, got nil")
+	}
+	if !errors.Is(err, expectedErr) && err.Error() != "failed to create request: factory error" {
+		t.Errorf("Expected factory error, got %v", err)
+	}
+	if resp != nil {
+		t.Error("Expected nil response on factory error")
+	}
+}
+
+func TestExecuteHTTPBlocking_PostWithBody(t *testing.T) {
+	receivedBodies := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBodies = append(receivedBodies, string(body))
+
+		if len(receivedBodies) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("success"))
+		}
+	}))
+	defer server.Close()
+
+	cb, err := NewZeroTolerance(WithCooldownTimer(100 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("Failed to create circuit breaker: %v", err)
+	}
+
+	client := &http.Client{}
+	expectedBody := `{"key":"value"}`
+	requestFactory := func() (*http.Request, error) {
+		body := strings.NewReader(expectedBody)
+		req, err := http.NewRequest("POST", server.URL, body)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := cb.ExecuteHTTPBlocking(ctx, client, requestFactory)
+
+	if err != nil {
+		t.Errorf("Expected no error, got %v", err)
+	}
+	if resp == nil {
+		t.Fatal("Expected response, got nil")
+	}
+	defer resp.Body.Close()
+
+	if len(receivedBodies) != 2 {
+		t.Fatalf("Expected 2 requests, got %d", len(receivedBodies))
+	}
+	for i, body := range receivedBodies {
+		if body != expectedBody {
+			t.Errorf("Request %d: expected body %s, got %s", i+1, expectedBody, body)
+		}
 	}
 }
